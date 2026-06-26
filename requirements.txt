@@ -2,7 +2,10 @@ streamlit==1.58.0
 numpy==1.26.4
 pandas==2.2.3
 
-opencv-python-headless==4.10.0.84
+opencv-python==4.10.0.84
+deepface==0.0.100
+tensorflow==2.16.1
+tf-keras==2.16.0
 
 librosa==0.10.2.post1
 soundfile==0.12.1
