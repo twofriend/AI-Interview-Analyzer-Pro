@@ -8,11 +8,21 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from modules.audio_analysis import analyze_voice, extract_audio_to_wav, transcribe_audio
+
+from modules.diagnostics import package_status
+from modules.emotion_analysis import analyze_emotions
+from modules.gaze_analysis import analyze_gaze
+from modules.io_utils import extract_audio_to_wav, save_uploaded_file
 from modules.report_generator import generate_pdf
-from modules.scoring import clarity_score, overall_practice_score, performance_band
+from modules.scoring import (
+    clarity_score,
+    overall_practice_score,
+    performance_band,
+)
 from modules.text_analysis import analyze_text
-from modules.video_analysis import analyze_emotions, analyze_gaze
+from modules.transcription import transcribe_audio
+from modules.voice_analysis import analyze_voice
+
 
 st.set_page_config(page_title="AI Interview Analyzer Pro — Academic", page_icon="🎙️", layout="wide")
 
