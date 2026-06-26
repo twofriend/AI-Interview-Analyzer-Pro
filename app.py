@@ -1,277 +1,291 @@
-from __future__ import annotations
 
-from dataclasses import asdict
-from pathlib import Path
+import io
+import math
 import tempfile
+from pathlib import Path
 
+import numpy as np
 import pandas as pd
-import plotly.express as px
+import rasterio
 import streamlit as st
+import matplotlib.pyplot as plt
 
 
-from modules.diagnostics import package_status
-from modules.emotion_analysis import analyze_emotions
-from modules.gaze_analysis import analyze_gaze
-from modules.io_utils import extract_audio_to_wav, save_uploaded_file
-from modules.report_generator import generate_pdf
-from modules.scoring import (
-    clarity_score,
-    overall_practice_score,
-    performance_band,
-)
-from modules.text_analysis import analyze_text
-from modules.transcription import transcribe_audio
-from modules.voice_analysis import analyze_voice
-
-
-st.set_page_config(page_title="AI Interview Analyzer Pro — Academic", page_icon="🎙️", layout="wide")
-
-st.title("🎙️ AI Interview Analyzer Pro")
-st.markdown("""
-### Academic multimodal interview-practice dashboard
-
-Analyze a recorded practice interview using pretrained deep-learning models for facial emotion
-patterns, camera-facing visual attention, speech transcription, voice delivery, and text features.
-""")
-st.warning(
-    "Academic practice tool only: do not use the scores as an automated hiring, rejection, "
-    "grading, diagnostic, honesty, personality, intelligence, or competence decision."
+st.set_page_config(
+    page_title="Velix GeoAI Phase 1",
+    page_icon="🛰️",
+    layout="wide"
 )
 
-with st.sidebar:
-    st.header("Candidate and rubric")
-    candidate_name = st.text_input("Candidate name", "Syed Nasir Shah")
-    role = st.text_input("Practice role", "AI / Data Science Position")
-    question = st.text_area(
-        "Interview question",
-        "Tell me about yourself and explain why you are suitable for this role.",
-        height=90,
-    )
-    keyword_text = st.text_input(
-        "Expected keywords (comma-separated)",
-        "python, machine learning, deep learning, communication, project",
-    )
-    whisper_size = st.selectbox(
-        "Transcription model",
-        ["tiny", "base"],
-        index=0,
-        help="Tiny is faster. Base is usually more accurate but takes longer.",
+st.title("🛰️ Velix GeoAI Phase 1: Satellite Index Dashboard")
+st.caption("Upload a Sentinel-2 style GeoTIFF and calculate NDVI, NDWI, NDBI, land-cover masks, and area statistics.")
+
+
+# -----------------------------
+# Helper Functions
+# -----------------------------
+def safe_divide(numerator, denominator):
+    return np.divide(
+        numerator,
+        denominator,
+        out=np.zeros_like(numerator, dtype=np.float32),
+        where=np.abs(denominator) > 1e-6
     )
 
-    st.header("Practice-score weights")
-    weights = {
-        "composure": st.slider("Composure pattern", 0, 100, 20),
-        "gaze": st.slider("Camera-facing attention", 0, 100, 20),
-        "delivery": st.slider("Voice delivery", 0, 100, 30),
-        "clarity": st.slider("Transcript clarity", 0, 100, 30),
-    }
 
-uploaded = st.file_uploader(
-    "Upload a recorded interview video",
-    type=["mp4", "mov", "avi", "mkv"],
-    help="For a quick test, use a clear 30–90 second video with one visible speaker.",
+def normalize_for_rgb(arr):
+    arr = arr.astype(np.float32)
+    p2, p98 = np.nanpercentile(arr, (2, 98))
+    if p98 - p2 == 0:
+        return np.zeros_like(arr)
+    arr = (arr - p2) / (p98 - p2)
+    return np.clip(arr, 0, 1)
+
+
+def plot_array(array, title, cmap=None, vmin=None, vmax=None):
+    fig, ax = plt.subplots(figsize=(7, 6))
+    im = ax.imshow(array, cmap=cmap, vmin=vmin, vmax=vmax)
+    ax.set_title(title)
+    ax.axis("off")
+    if cmap is not None:
+        fig.colorbar(im, ax=ax, fraction=0.035, pad=0.02)
+    st.pyplot(fig)
+
+
+def get_pixel_area_km2(dataset):
+    """
+    Calculates pixel area in km².
+    Best if GeoTIFF is in projected CRS such as UTM.
+    If CRS is geographic degrees, area is approximate.
+    """
+    transform = dataset.transform
+    pixel_width = abs(transform.a)
+    pixel_height = abs(transform.e)
+
+    if dataset.crs and dataset.crs.is_projected:
+        return (pixel_width * pixel_height) / 1_000_000
+
+    # approximate conversion for degrees near image center latitude
+    bounds = dataset.bounds
+    center_lat = (bounds.top + bounds.bottom) / 2
+    meters_per_degree_lat = 111_320
+    meters_per_degree_lon = 111_320 * math.cos(math.radians(center_lat))
+    return (pixel_width * meters_per_degree_lon * pixel_height * meters_per_degree_lat) / 1_000_000
+
+
+def classify_indices(ndvi, ndwi, ndbi):
+    """
+    Simple threshold-based masks for Phase 1.
+    These thresholds are starting points; tune them for Karachi using visual inspection in QGIS.
+    """
+    water = ndwi > 0.20
+    vegetation = (ndvi > 0.30) & (~water)
+    built_up = (ndbi > 0.10) & (ndvi < 0.25) & (~water)
+    bare_land = (~water) & (~vegetation) & (~built_up)
+
+    classified = np.zeros(ndvi.shape, dtype=np.uint8)
+    classified[water] = 1
+    classified[vegetation] = 2
+    classified[built_up] = 3
+    classified[bare_land] = 4
+
+    return classified, water, vegetation, built_up, bare_land
+
+
+# -----------------------------
+# Sidebar
+# -----------------------------
+st.sidebar.header("Band Mapping")
+
+st.sidebar.markdown(
+    """
+    Recommended Sentinel-2 band order for a single multiband GeoTIFF:
+
+    **Band 1 = Blue B2**  
+    **Band 2 = Green B3**  
+    **Band 3 = Red B4**  
+    **Band 4 = NIR B8**  
+    **Band 5 = SWIR B11**  
+    """
 )
 
-if uploaded is not None:
-    temp_video = tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded.name).suffix)
-    temp_video.write(uploaded.read())
-    temp_video.close()
-    video_path = Path(temp_video.name)
-    st.video(str(video_path))
+blue_band = st.sidebar.number_input("Blue band index (B2)", min_value=1, value=1)
+green_band = st.sidebar.number_input("Green band index (B3)", min_value=1, value=2)
+red_band = st.sidebar.number_input("Red band index (B4)", min_value=1, value=3)
+nir_band = st.sidebar.number_input("NIR band index (B8)", min_value=1, value=4)
+swir_band = st.sidebar.number_input("SWIR band index (B11)", min_value=1, value=5)
 
-    if st.button("🚀 Analyze practice interview", type="primary"):
-        progress = st.progress(0, text="Preparing the video…")
-        try:
-            progress.progress(10, text="Extracting the audio track…")
-            audio_path = extract_audio_to_wav(video_path)
+st.sidebar.header("Thresholds")
+ndvi_threshold = st.sidebar.slider("Vegetation NDVI threshold", -1.0, 1.0, 0.30, 0.01)
+ndwi_threshold = st.sidebar.slider("Water NDWI threshold", -1.0, 1.0, 0.20, 0.01)
+ndbi_threshold = st.sidebar.slider("Built-up NDBI threshold", -1.0, 1.0, 0.10, 0.01)
 
-            progress.progress(25, text="Transcribing speech with Faster-Whisper…")
-            transcript_result = transcribe_audio(str(audio_path), whisper_size)
 
-            progress.progress(45, text="Analyzing transcript and expected keywords…")
-            keywords = [item.strip() for item in keyword_text.split(",") if item.strip()]
-            text_result = analyze_text(transcript_result.text, keywords)
+uploaded_file = st.file_uploader(
+    "Upload Sentinel-2 multiband GeoTIFF (.tif / .tiff)",
+    type=["tif", "tiff"]
+)
 
-            progress.progress(55, text="Analyzing voice delivery…")
-            voice_result = analyze_voice(str(audio_path), text_result.word_count)
+if uploaded_file is None:
+    st.info("Upload a multiband GeoTIFF to begin. For Phase 1, use Sentinel-2 bands B2, B3, B4, B8, and B11.")
+    st.stop()
 
-            progress.progress(70, text="Analyzing facial emotion patterns…")
-            emotion_result = analyze_emotions(str(video_path))
 
-            progress.progress(85, text="Estimating camera-facing visual attention…")
-            gaze_result = analyze_gaze(str(video_path))
+# -----------------------------
+# Read GeoTIFF
+# -----------------------------
+with tempfile.NamedTemporaryFile(delete=False, suffix=".tif") as tmp:
+    tmp.write(uploaded_file.read())
+    tmp_path = tmp.name
 
-            clarity = clarity_score(
-                text_result.sentiment_score,
-                text_result.filler_rate_per_100_words,
-                text_result.lexical_diversity,
-                text_result.keyword_coverage,
-                bool(keywords),
+try:
+    with rasterio.open(tmp_path) as src:
+        band_count = src.count
+        st.success(f"GeoTIFF loaded successfully. Bands found: {band_count}")
+
+        needed_bands = [blue_band, green_band, red_band, nir_band, swir_band]
+        if max(needed_bands) > band_count:
+            st.error(
+                f"Your file has only {band_count} bands, but your selected band mapping requires band {max(needed_bands)}."
             )
-            overall = overall_practice_score(
-                emotion_result.composure_score,
-                gaze_result.forward_gaze_score,
-                voice_result.delivery_score,
-                clarity,
-                weights,
-            )
-            band = performance_band(overall)
+            st.stop()
 
-            st.session_state["analysis"] = {
-                "candidate_name": candidate_name,
-                "role": role,
-                "question": question,
-                "emotion": emotion_result,
-                "gaze": gaze_result,
-                "voice": voice_result,
-                "transcript": transcript_result,
-                "text": text_result,
-                "clarity": clarity,
-                "overall": overall,
-                "band": band,
-            }
-            progress.progress(100, text="Analysis complete.")
-        except Exception as exc:
-            progress.empty()
-            st.error(f"Analysis could not be completed: {exc}")
+        blue = src.read(int(blue_band)).astype(np.float32)
+        green = src.read(int(green_band)).astype(np.float32)
+        red = src.read(int(red_band)).astype(np.float32)
+        nir = src.read(int(nir_band)).astype(np.float32)
+        swir = src.read(int(swir_band)).astype(np.float32)
 
-if "analysis" in st.session_state:
-    data = st.session_state["analysis"]
-    emotion = data["emotion"]
-    gaze = data["gaze"]
-    voice = data["voice"]
-    transcript = data["transcript"]
-    text = data["text"]
-    clarity = data["clarity"]
-    overall = data["overall"]
-    band = data["band"]
+        profile = src.profile
+        pixel_area_km2 = get_pixel_area_km2(src)
 
-    st.divider()
-    st.header("Results")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Composure pattern", f"{emotion.composure_score:.1f}%")
-    c2.metric("Camera-facing attention", f"{gaze.forward_gaze_score:.1f}%")
-    c3.metric("Voice delivery", f"{voice.delivery_score:.1f}%")
-    c4.metric("Transcript clarity", f"{clarity:.1f}%")
-    c5.metric("Overall practice score", f"{overall:.1f}%")
-    st.info(f"**Performance band:** {band}")
+        bounds = src.bounds
+        crs = src.crs
 
-    score_df = pd.DataFrame({
-        "Metric": ["Composure pattern", "Camera-facing attention", "Voice delivery", "Transcript clarity", "Overall"],
-        "Score": [emotion.composure_score, gaze.forward_gaze_score, voice.delivery_score, clarity, overall],
+except Exception as e:
+    st.error(f"Could not read GeoTIFF: {e}")
+    st.stop()
+
+
+# -----------------------------
+# Calculate Indices
+# -----------------------------
+ndvi = safe_divide(nir - red, nir + red)
+ndwi = safe_divide(green - nir, green + nir)
+ndbi = safe_divide(swir - nir, swir + nir)
+
+water = ndwi > ndwi_threshold
+vegetation = (ndvi > ndvi_threshold) & (~water)
+built_up = (ndbi > ndbi_threshold) & (ndvi < 0.25) & (~water)
+bare_land = (~water) & (~vegetation) & (~built_up)
+
+classified = np.zeros(ndvi.shape, dtype=np.uint8)
+classified[water] = 1
+classified[vegetation] = 2
+classified[built_up] = 3
+classified[bare_land] = 4
+
+rgb = np.dstack([
+    normalize_for_rgb(red),
+    normalize_for_rgb(green),
+    normalize_for_rgb(blue)
+])
+
+
+# -----------------------------
+# Metadata
+# -----------------------------
+with st.expander("GeoTIFF Metadata"):
+    st.write({
+        "CRS": str(crs),
+        "Bounds": {
+            "left": bounds.left,
+            "bottom": bounds.bottom,
+            "right": bounds.right,
+            "top": bounds.top,
+        },
+        "Width": profile["width"],
+        "Height": profile["height"],
+        "Pixel area km²": pixel_area_km2,
     })
-    st.plotly_chart(px.bar(score_df, x="Metric", y="Score", range_y=[0,100],
-                           title="Practice performance overview", text_auto=".1f"), use_container_width=True)
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "😊 Emotion timeline", "👀 Visual attention", "🎙️ Voice delivery",
-        "📝 Transcript and text", "📄 Report and downloads"
-    ])
 
-    with tab1:
-        if emotion.error:
-            st.warning(emotion.error)
-        if not emotion.timeline.empty:
-            st.dataframe(emotion.timeline, use_container_width=True)
-            st.plotly_chart(px.scatter(emotion.timeline, x="time_sec", y="confidence", color="emotion",
-                                       title="Detected dominant emotion over sampled frames"),
-                               use_container_width=True)
-            counts = emotion.timeline["emotion"].value_counts().reset_index()
-            counts.columns = ["Emotion", "Frames"]
-            st.plotly_chart(px.pie(counts, names="Emotion", values="Frames", title="Emotion distribution"),
-                               use_container_width=True)
-        st.write("Dominant sampled emotion:", emotion.dominant_emotion)
-        st.write("Frames analyzed:", emotion.frames_analyzed)
+# -----------------------------
+# Visual Outputs
+# -----------------------------
+tab1, tab2, tab3, tab4 = st.tabs(["RGB Image", "Index Maps", "Classified Map", "Area Report"])
 
-    with tab2:
-        if gaze.error:
-            st.warning(gaze.error)
-        st.dataframe(pd.DataFrame([{
-            "Forward-gaze proxy": f"{gaze.forward_gaze_score:.2f}%",
-            "Face visibility": f"{gaze.face_visibility_score:.2f}%",
-            "Frames sampled": gaze.frames_sampled,
-            "Method": gaze.method,
-        }]), use_container_width=True)
-        st.caption("Approximate camera-facing attention proxy; not a clinical eye tracker.")
+with tab1:
+    st.subheader("Natural Color RGB")
+    plot_array(rgb, "RGB Composite")
 
-    with tab3:
-        if voice.error:
-            st.warning(voice.error)
-        st.dataframe(pd.DataFrame([asdict(voice)]), use_container_width=True)
-        st.write("Interpretation:", voice.interpretation)
+with tab2:
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        plot_array(ndvi, "NDVI: Vegetation Index", cmap="RdYlGn", vmin=-1, vmax=1)
+    with c2:
+        plot_array(ndwi, "NDWI: Water Index", cmap="Blues", vmin=-1, vmax=1)
+    with c3:
+        plot_array(ndbi, "NDBI: Built-up Index", cmap="inferno", vmin=-1, vmax=1)
 
-    with tab4:
-        if transcript.error:
-            st.warning(f"Transcription note: {transcript.error}")
-        st.subheader("Transcript")
-        st.write(transcript.text or "No transcript was produced.")
-        st.download_button("Download transcript", transcript.text or "", "interview_transcript.txt", "text/plain")
+with tab3:
+    st.subheader("Simple Land Cover Classification")
+    st.markdown(
+        """
+        Class codes:  
+        **1 = Water**, **2 = Vegetation**, **3 = Built-up**, **4 = Bare land / Other**
+        """
+    )
+    plot_array(classified, "Threshold-Based Land Cover Map", cmap="tab10", vmin=0, vmax=4)
 
-        st.dataframe(pd.DataFrame([{
-            "Detected language": transcript.language,
-            "Language probability": transcript.language_probability,
-            "Word count": text.word_count,
-            "Sentiment": text.sentiment_label,
-            "Sentiment score": text.sentiment_score,
-            "Filler words": text.filler_count,
-            "Fillers per 100 words": text.filler_rate_per_100_words,
-            "Lexical diversity": text.lexical_diversity,
-            "Expected-keyword coverage": text.keyword_coverage,
-        }]), use_container_width=True)
-        st.write("Matched keywords:", ", ".join(text.matched_keywords) or "None")
-        st.write("Missing keywords:", ", ".join(text.missing_keywords) or "None")
-        if transcript.segments:
-            st.subheader("Timestamped segments")
-            st.dataframe(pd.DataFrame(transcript.segments), use_container_width=True)
+with tab4:
+    st.subheader("Area Statistics")
 
-    with tab5:
-        summary_df = pd.DataFrame([
-            {"Metric": "Composure pattern", "Score": emotion.composure_score},
-            {"Metric": "Camera-facing attention", "Score": gaze.forward_gaze_score},
-            {"Metric": "Voice delivery", "Score": voice.delivery_score},
-            {"Metric": "Transcript clarity", "Score": clarity},
-            {"Metric": "Overall practice score", "Score": overall},
-        ])
-        st.download_button("Download scores CSV", summary_df.to_csv(index=False),
-                           "interview_practice_scores.csv", "text/csv")
+    total_pixels = classified.size
+    total_area = total_pixels * pixel_area_km2
 
-        pdf_path = generate_pdf(
-            data["candidate_name"], data["role"], data["question"],
-            {"Composure pattern": emotion.composure_score,
-             "Camera-facing attention": gaze.forward_gaze_score,
-             "Voice delivery": voice.delivery_score,
-             "Transcript clarity": clarity,
-             "Overall practice score": overall},
-            band,
-            {"Dominant sampled emotion": emotion.dominant_emotion,
-             "Frames analyzed": emotion.frames_analyzed,
-             "Analysis note": emotion.error or "Completed"},
-            {"Forward-gaze proxy": f"{gaze.forward_gaze_score:.2f}%",
-             "Face visibility": f"{gaze.face_visibility_score:.2f}%",
-             "Method": gaze.method,
-             "Analysis note": gaze.error or "Completed"},
-            {"Duration": f"{voice.duration_sec:.2f} seconds",
-             "Speaking rate": f"{voice.speaking_rate_wpm:.2f} words/minute",
-             "Median pitch": f"{voice.median_pitch_hz:.2f} Hz",
-             "Silence ratio": f"{voice.silence_ratio:.2f}%",
-             "Interpretation": voice.interpretation},
-            {"Language": transcript.language,
-             "Word count": text.word_count,
-             "Sentiment": text.sentiment_label,
-             "Filler words": text.filler_count,
-             "Lexical diversity": f"{text.lexical_diversity:.2f}%",
-             "Keyword coverage": f"{text.keyword_coverage:.2f}%"},
-            transcript.text,
-        )
-        with open(pdf_path, "rb") as handle:
-            st.download_button("Download detailed PDF report", handle,
-                               "AI_Interview_Analyzer_Academic_Report.pdf", "application/pdf")
+    stats = pd.DataFrame([
+        ["Water", int(np.sum(water)), np.sum(water) * pixel_area_km2],
+        ["Vegetation", int(np.sum(vegetation)), np.sum(vegetation) * pixel_area_km2],
+        ["Built-up", int(np.sum(built_up)), np.sum(built_up) * pixel_area_km2],
+        ["Bare land / Other", int(np.sum(bare_land)), np.sum(bare_land) * pixel_area_km2],
+    ], columns=["Class", "Pixel Count", "Area km²"])
 
-        st.subheader("Limitations")
-        st.markdown("""
-- Pretrained models can be wrong and may behave differently across lighting, accents, cultures, disabilities, and recording devices.
-- Facial emotion labels do not reveal a person's internal state.
-- Camera-facing attention is not the same as genuine eye contact.
-- Voice and language metrics may reflect recording quality rather than the speaker.
-- A human evaluator must review the original video, transcript, context, and rubric.
-""")
+    stats["Percentage"] = (stats["Area km²"] / total_area) * 100
+    stats["Area km²"] = stats["Area km²"].round(4)
+    stats["Percentage"] = stats["Percentage"].round(2)
+
+    st.dataframe(stats, use_container_width=True)
+
+    csv = stats.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download Area Statistics CSV",
+        data=csv,
+        file_name="geoai_phase1_area_statistics.csv",
+        mime="text/csv"
+    )
+
+    report_text = f"""
+Velix GeoAI Phase 1 Report
+
+Total estimated area: {total_area:.4f} km²
+
+Class-wise summary:
+{stats.to_string(index=False)}
+
+Interpretation:
+- High NDVI areas indicate vegetation.
+- High NDWI areas indicate water or wet surfaces.
+- High NDBI areas indicate built-up or impervious urban surfaces.
+- Thresholds should be tuned using QGIS visual inspection and local knowledge.
+"""
+
+    st.download_button(
+        "Download Simple Text Report",
+        data=report_text,
+        file_name="geoai_phase1_report.txt",
+        mime="text/plain"
+    )
+
+
+st.caption("Phase 1 prototype. For research-grade results, validate thresholds with ground truth or ESA WorldCover/Dynamic World labels.")
